@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package jpeg
+package resizejpeg
 
 import (
 	"fmt"
@@ -20,10 +20,6 @@ func benchmarkDCT(b *testing.B, f func(*block)) {
 			f(&blk)
 		}
 	}
-}
-
-func BenchmarkFDCT(b *testing.B) {
-	benchmarkDCT(b, fdct)
 }
 
 func BenchmarkIDCT(b *testing.B) {
@@ -91,8 +87,7 @@ func TestDCT(t *testing.T) {
 		testDCT(t, "slowIDCT", blocks, slowIDCT, slowerIDCT, 0, 64)
 	}
 
-	// Check that the optimized and slow FDCT implementations agree.
-	testDCT(t, "FDCT", blocks, fdct, slowFDCT, 1, 8)
+	// Check that the optimized and slow IDCT implementations agree.
 	testDCT(t, "IDCT", blocks, idct, slowIDCT, 1, 8)
 }
 

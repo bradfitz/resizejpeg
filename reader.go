@@ -2,15 +2,15 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package jpeg implements a JPEG image decoder and encoder.
+// Package resizejpeg implements a standalone JPEG image decoder.
 //
 // JPEG is defined in ITU-T T.81: https://www.w3.org/Graphics/JPEG/itu-t81.pdf.
-package jpeg
+package resizejpeg
 
 import (
 	"image"
 	"image/color"
-	"image/internal/imageutil"
+	"image/draw"
 	"io"
 )
 
@@ -86,13 +86,6 @@ var unzig = [blockSize]int{
 	29, 22, 15, 23, 30, 37, 44, 51,
 	58, 59, 52, 45, 38, 31, 39, 46,
 	53, 60, 61, 54, 47, 55, 62, 63,
-}
-
-// Deprecated: Reader is not used by the [image/jpeg] package and should
-// not be used by others. It is kept for compatibility.
-type Reader interface {
-	io.ByteReader
-	io.Reader
 }
 
 // bits holds the unprocessed bits that have been taken from the byte-stream.
@@ -693,7 +686,7 @@ func (d *decoder) applyBlack() (image.Image, error) {
 		// above, so in practice, only the fourth channel (black) is inverted.
 		bounds := d.img3.Bounds()
 		img := image.NewRGBA(bounds)
-		imageutil.DrawYCbCr(img, bounds, d.img3, bounds.Min)
+		draw.Draw(img, bounds, d.img3, bounds.Min, draw.Src)
 		for iBase, y := 0, bounds.Min.Y; y < bounds.Max.Y; iBase, y = iBase+img.Stride, y+1 {
 			for i, x := iBase+3, bounds.Min.X; x < bounds.Max.X; i, x = i+4, x+1 {
 				img.Pix[i] = 255 - d.blackPix[(y-bounds.Min.Y)*d.blackStride+(x-bounds.Min.X)]
@@ -830,8 +823,4 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 		}, nil
 	}
 	return image.Config{}, FormatError("missing SOF marker")
-}
-
-func init() {
-	image.RegisterFormat("jpeg", "\xff\xd8", Decode, DecodeConfig)
 }

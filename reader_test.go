@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package jpeg
+package resizejpeg
 
 import (
 	"bytes"
@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	stdjpeg "image/jpeg"
 	"io"
 	"math/rand"
 	"os"
@@ -24,16 +25,16 @@ import (
 // space for color images, and Y space for grayscale images.
 func TestDecodeProgressive(t *testing.T) {
 	testCases := []string{
-		"../testdata/video-001",
-		"../testdata/video-001.q50.410",
-		"../testdata/video-001.q50.411",
-		"../testdata/video-001.q50.420",
-		"../testdata/video-001.q50.422",
-		"../testdata/video-001.q50.440",
-		"../testdata/video-001.q50.444",
-		"../testdata/video-005.gray.q50",
-		"../testdata/video-005.gray.q50.2x2",
-		"../testdata/video-001.separate.dc.progression",
+		"testdata/video-001",
+		"testdata/video-001.q50.410",
+		"testdata/video-001.q50.411",
+		"testdata/video-001.q50.420",
+		"testdata/video-001.q50.422",
+		"testdata/video-001.q50.440",
+		"testdata/video-001.q50.444",
+		"testdata/video-005.gray.q50",
+		"testdata/video-005.gray.q50.2x2",
+		"testdata/video-001.separate.dc.progression",
 	}
 	for _, tc := range testCases {
 		m0, err := decodeFile(tc + ".jpeg")
@@ -118,7 +119,7 @@ func (r *eofReader) Read(b []byte) (n int, err error) {
 
 func TestDecodeEOF(t *testing.T) {
 	// Check that if reader returns final data and EOF at same time, jpeg handles it.
-	data, err := os.ReadFile("../testdata/video-001.jpeg")
+	data, err := os.ReadFile("testdata/video-001.jpeg")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +190,7 @@ func pixString(pix []byte, stride, x, y int) string {
 }
 
 func TestTruncatedSOSDataDoesntPanic(t *testing.T) {
-	b, err := os.ReadFile("../testdata/video-005.gray.q50.jpeg")
+	b, err := os.ReadFile("testdata/video-005.gray.q50.jpeg")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +436,7 @@ func TestExtraneousData(t *testing.T) {
 	src := image.NewRGBA(image.Rect(0, 0, 1, 1))
 	src.Set(0, 0, color.RGBA{0xff, 0x00, 0x00, 0xff})
 	buf := new(bytes.Buffer)
-	if err := Encode(buf, src, nil); err != nil {
+	if err := stdjpeg.Encode(buf, src, nil); err != nil {
 		t.Fatalf("encode: %v", err)
 	}
 	enc := buf.String()
@@ -491,7 +492,7 @@ func TestExtraneousData(t *testing.T) {
 }
 
 func TestIssue56724(t *testing.T) {
-	b, err := os.ReadFile("../testdata/video-001.jpeg")
+	b, err := os.ReadFile("testdata/video-001.jpeg")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +550,7 @@ func TestIssue78368(t *testing.T) {
 }
 
 func TestBadRestartMarker(t *testing.T) {
-	b, err := os.ReadFile("../testdata/video-001.restart2.jpeg")
+	b, err := os.ReadFile("testdata/video-001.restart2.jpeg")
 	if err != nil {
 		t.Fatal(err)
 	} else if len(b) != 4855 {
@@ -600,10 +601,10 @@ func TestDecodeFlexSubsampling(t *testing.T) {
 		name     string
 		filename string
 	}{
-		{"2x2,1x1,2x2", "../testdata/video-001.q50.221122.jpeg"}, // Cb differs from Cr
-		{"2x1,1x2,1x1", "../testdata/video-001.q50.211211.jpeg"}, // All three differ
-		{"2x2,2x1,1x2", "../testdata/video-001.q50.222112.jpeg"}, // All three differ
-		{"1x2,1x1,2x1", "../testdata/video-001.q50.121121.jpeg"}, // Y not max, all differ
+		{"2x2,1x1,2x2", "testdata/video-001.q50.221122.jpeg"}, // Cb differs from Cr
+		{"2x1,1x2,1x1", "testdata/video-001.q50.211211.jpeg"}, // All three differ
+		{"2x2,2x1,1x2", "testdata/video-001.q50.222112.jpeg"}, // All three differ
+		{"1x2,1x1,2x1", "testdata/video-001.q50.121121.jpeg"}, // Y not max, all differ
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -645,9 +646,34 @@ func benchmarkDecode(b *testing.B, filename string) {
 }
 
 func BenchmarkDecodeBaseline(b *testing.B) {
-	benchmarkDecode(b, "../testdata/video-001.jpeg")
+	benchmarkDecode(b, "testdata/video-001.jpeg")
 }
 
 func BenchmarkDecodeProgressive(b *testing.B) {
-	benchmarkDecode(b, "../testdata/video-001.progressive.jpeg")
+	benchmarkDecode(b, "testdata/video-001.progressive.jpeg")
+}
+
+func averageDelta(m0, m1 image.Image) int64 {
+	b := m0.Bounds()
+	var sum, n int64
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			c0 := m0.At(x, y)
+			c1 := m1.At(x, y)
+			r0, g0, b0, _ := c0.RGBA()
+			r1, g1, b1, _ := c1.RGBA()
+			sum += delta(r0, r1)
+			sum += delta(g0, g1)
+			sum += delta(b0, b1)
+			n += 3
+		}
+	}
+	return sum / n
+}
+
+func delta(a, b uint32) int64 {
+	if a < b {
+		return int64(b - a)
+	}
+	return int64(a - b)
 }
