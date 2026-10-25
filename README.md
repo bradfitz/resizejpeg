@@ -1,10 +1,13 @@
 # resizejpeg
 
-A standalone, decoder-only fork of Go’s `image/jpeg`.
+Pure-Go JPEG decoding and resizing, without native libraries or subprocesses.
 
-The first commit imports Go’s JPEG package unchanged. This commit removes
-the encoder, replaces the inaccessible Go-internal drawing helper, and
-makes the existing decoder regressions runnable as a module.
+- `Decode(r, factor)`: reduced-IDCT decoding at factors 1, 2, 4, or 8.
+- `DecodeConfig(r)`: original image dimensions and color model.
 
 Upstream: Go commit `022c8636110ebac86a9b88724cda168ed713c21f`
-(`go1.27.2`, October 8, 2026). See `LICENSE` for Go’s BSD license.
+(`go1.27.2`, October 8, 2026). The first commit is an unchanged upstream
+import; subsequent commits contain the standalone adaptation and features.
+
+All code uses Go’s BSD-style license in `LICENSE`. Upstream copyright
+notices are retained.

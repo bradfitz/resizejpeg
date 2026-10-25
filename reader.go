@@ -2,9 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package resizejpeg implements a standalone JPEG image decoder.
-//
-// JPEG is defined in ITU-T T.81: https://www.w3.org/Graphics/JPEG/itu-t81.pdf.
 package resizejpeg
 
 import (
@@ -113,6 +110,7 @@ type decoder struct {
 		nUnreadable int
 	}
 	width, height int
+	factor        int // Decode at 1/factor resolution; one of 1, 2, 4, 8.
 
 	img1        *image.Gray
 	img3        *image.YCbCr
@@ -139,11 +137,12 @@ type decoder struct {
 	adobeTransform      uint8
 	eobRun              uint16 // End-of-Band run, specified in section G.1.2.2.
 
-	comp       [maxComponents]component
-	progCoeffs [maxComponents][]block // Saved state between progressive-mode scans.
-	huff       [maxTc + 1][maxTh + 1]huffman
-	quant      [maxTq + 1]block // Quantization tables, in zig-zag order.
-	tmp        [2 * blockSize]byte
+	comp        [maxComponents]component
+	progCoeffs  [maxComponents][]int32  // Packed retained coefficients between progressive scans.
+	progNonzero [maxComponents][]uint64 // Nonzero flags for discarded high frequencies.
+	huff        [maxTc + 1][maxTh + 1]huffman
+	quant       [maxTq + 1]block // Quantization tables, in natural order.
+	tmp         [2 * blockSize]byte
 }
 
 // fill fills up the d.bytes.buf buffer from the underlying io.Reader. It
@@ -320,6 +319,9 @@ func (d *decoder) processSOF(n int) error {
 	}
 	d.height = int(d.tmp[1])<<8 + int(d.tmp[2])
 	d.width = int(d.tmp[3])<<8 + int(d.tmp[4])
+	if d.width == 0 || d.height == 0 {
+		return FormatError("zero image dimension")
+	}
 	if int(d.tmp[5]) != d.nComp {
 		return FormatError("SOF has wrong length")
 	}
@@ -444,7 +446,7 @@ loop:
 				return err
 			}
 			for i := range d.quant[tq] {
-				d.quant[tq][i] = int32(d.tmp[i])
+				d.quant[tq][unzig[i]] = int32(d.tmp[i])
 			}
 		case 1:
 			if n < 2*blockSize {
@@ -455,7 +457,7 @@ loop:
 				return err
 			}
 			for i := range d.quant[tq] {
-				d.quant[tq][i] = int32(d.tmp[2*i])<<8 | int32(d.tmp[2*i+1])
+				d.quant[tq][unzig[i]] = int32(d.tmp[2*i])<<8 | int32(d.tmp[2*i+1])
 			}
 		}
 	}
@@ -785,16 +787,31 @@ func (d *decoder) convertToRGB() (image.Image, error) {
 	return img, nil
 }
 
-// Decode reads a JPEG image from r and returns it as an [image.Image].
-func Decode(r io.Reader) (image.Image, error) {
-	var d decoder
+// Decode reads a JPEG image from r at 1/factor of its original dimensions.
+// Factor must be 1, 2, 4, or 8; invalid factors are rejected without reading r.
+// Output dimensions are rounded up, so a 17x9 image at factor 2 is 9x5.
+//
+// Downsampling uses a reduced inverse DCT, not a full decode followed by a
+// resize. No full-resolution pixel or coefficient buffer is allocated when
+// factor > 1. Progressive JPEGs retain the low-frequency coefficients and
+// a 64-bit nonzero mask per source block to decode later refinement scans.
+//
+// Factor 1 performs a full-resolution decode. Like [image/jpeg.Decode], the
+// result is an *image.Gray, *image.YCbCr, *image.RGBA, or *image.CMYK.
+func Decode(r io.Reader, factor int) (image.Image, error) {
+	switch factor {
+	case 1, 2, 4, 8:
+	default:
+		return nil, UnsupportedError("scale factor must be 1, 2, 4, or 8")
+	}
+	d := decoder{factor: factor}
 	return d.decode(r, false)
 }
 
 // DecodeConfig returns the color model and dimensions of a JPEG image without
 // decoding the entire image.
 func DecodeConfig(r io.Reader) (image.Config, error) {
-	var d decoder
+	d := decoder{factor: 1}
 	if _, err := d.decode(r, true); err != nil {
 		return image.Config{}, err
 	}

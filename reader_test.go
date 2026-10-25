@@ -91,7 +91,7 @@ func decodeFile(filename string) (image.Image, error) {
 		return nil, err
 	}
 	defer f.Close()
-	return Decode(f)
+	return decodeFull(f)
 }
 
 type eofReader struct {
@@ -127,7 +127,7 @@ func TestDecodeEOF(t *testing.T) {
 	n := len(data)
 	for i := 0; i < n; {
 		r := &eofReader{data[:n-i], data[n-i:], -1}
-		_, err := Decode(r)
+		_, err := decodeFull(r)
 		if err != nil {
 			t.Errorf("Decode with Read() = %d, EOF: %v", r.lenAtEOF, err)
 		}
@@ -205,7 +205,7 @@ func TestTruncatedSOSDataDoesntPanic(t *testing.T) {
 		j = len(b)
 	}
 	for ; i < j; i++ {
-		Decode(bytes.NewReader(b[:i]))
+		decodeFull(bytes.NewReader(b[:i]))
 	}
 }
 
@@ -256,7 +256,7 @@ func TestLargeImageWithShortData(t *testing.T) {
 	})
 	defer timer.Stop()
 
-	_, err := Decode(strings.NewReader(input))
+	_, err := decodeFull(strings.NewReader(input))
 	if err == nil {
 		t.Fatalf("got nil error, want non-nil")
 	}
@@ -426,7 +426,7 @@ Sqm7JH//2Q==
 	if err != nil {
 		t.Fatalf("base64 DecodeString: %v", err)
 	}
-	if _, err = Decode(bytes.NewReader(data)); err != nil {
+	if _, err = decodeFull(bytes.NewReader(data)); err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
 }
@@ -472,7 +472,7 @@ func TestExtraneousData(t *testing.T) {
 		buf.WriteString("\xff\xd9")
 
 		// Check that we can still decode the resultant image.
-		got, err := Decode(buf)
+		got, err := decodeFull(buf)
 		if err != nil {
 			t.Errorf("could not decode image #%d: %v", i, err)
 			nerr++
@@ -499,14 +499,14 @@ func TestIssue56724(t *testing.T) {
 
 	b = b[:24] // truncate image data
 
-	_, err = Decode(bytes.NewReader(b))
+	_, err = decodeFull(bytes.NewReader(b))
 	if err != io.ErrUnexpectedEOF {
 		t.Errorf("got: %v, want: %v", err, io.ErrUnexpectedEOF)
 	}
 }
 
 func TestIssue78368(t *testing.T) {
-	Decode(bytes.NewReader([]byte{
+	decodeFull(bytes.NewReader([]byte{
 		0xff, 0xd8, 0xff, 0xdb, 0x00, 0x84, 0x00, 0x20, 0x20, 0x20, 0x20, 0x20,
 		0x20, 0xff, 0x20, 0x20, 0x20, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x20, 0xff, 0xff, 0xff, 0xff,
@@ -582,7 +582,7 @@ func TestBadRestartMarker(t *testing.T) {
 		data = append(data, prefix...)
 		data = append(data, infix...)
 		data = append(data, suffix...)
-		_, err := Decode(bytes.NewReader(data))
+		_, err := decodeFull(bytes.NewReader(data))
 		got := err == nil
 
 		if got != want {
@@ -628,30 +628,7 @@ func TestDecodeFlexSubsampling(t *testing.T) {
 	}
 }
 
-func benchmarkDecode(b *testing.B, filename string) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		b.Fatal(err)
-	}
-	cfg, err := DecodeConfig(bytes.NewReader(data))
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.SetBytes(int64(cfg.Width * cfg.Height * 4))
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		Decode(bytes.NewReader(data))
-	}
-}
-
-func BenchmarkDecodeBaseline(b *testing.B) {
-	benchmarkDecode(b, "testdata/video-001.jpeg")
-}
-
-func BenchmarkDecodeProgressive(b *testing.B) {
-	benchmarkDecode(b, "testdata/video-001.progressive.jpeg")
-}
+func decodeFull(r io.Reader) (image.Image, error) { return Decode(r, 1) }
 
 func averageDelta(m0, m1 image.Image) int64 {
 	b := m0.Bounds()

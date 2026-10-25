@@ -9,11 +9,16 @@ import (
 )
 
 // makeImg allocates and initializes the destination image.
-func (d *decoder) makeImg(mxx, myy int) {
+func (d *decoder) makeImg(mxx, myy int) error {
+	bs := 8 / d.factor
+	bounds := image.Rect(0, 0, (d.width+d.factor-1)/d.factor, (d.height+d.factor-1)/d.factor)
 	if d.nComp == 1 {
-		m := image.NewGray(image.Rect(0, 0, 8*mxx, 8*myy))
-		d.img1 = m.SubImage(image.Rect(0, 0, d.width, d.height)).(*image.Gray)
-		return
+		if err := checkAllocationSize(uint64(bs*mxx) * uint64(bs*myy)); err != nil {
+			return err
+		}
+		m := image.NewGray(image.Rect(0, 0, bs*mxx, bs*myy))
+		d.img1 = m.SubImage(bounds).(*image.Gray)
+		return nil
 	}
 
 	// Determine if we need flex mode for non-standard subsampling.
@@ -46,14 +51,43 @@ func (d *decoder) makeImg(mxx, myy int) {
 		}
 	}
 
-	m := image.NewYCbCr(image.Rect(0, 0, 8*d.maxH*mxx, 8*d.maxV*myy), subsampleRatio)
-	d.img3 = m.SubImage(image.Rect(0, 0, d.width, d.height)).(*image.YCbCr)
+	padded := image.Rect(0, 0, bs*d.maxH*mxx, bs*d.maxV*myy)
+	// image.NewYCbCr allocates all three planes in a single byte slice.
+	// Work in uint64 until the size is known to fit an int, including on
+	// 32-bit platforms. MCU padding makes the chroma divisions exact.
+	ch, cv := 1, 1
+	if !d.flex {
+		ch, cv = d.maxH/d.comp[1].h, d.maxV/d.comp[1].v
+	}
+	total := uint64(padded.Dx())*uint64(padded.Dy()) +
+		2*uint64(padded.Dx()/ch)*uint64(padded.Dy()/cv)
+	if err := checkAllocationSize(total); err != nil {
+		return err
+	}
+	if d.nComp == 4 || d.isRGB() {
+		if err := checkAllocationSize(4 * uint64(bounds.Dx()) * uint64(bounds.Dy())); err != nil {
+			return err
+		}
+	}
+	m := image.NewYCbCr(padded, subsampleRatio)
+	d.img3 = m.SubImage(bounds).(*image.YCbCr)
 
 	if d.nComp == 4 {
 		h3, v3 := d.comp[3].h, d.comp[3].v
-		d.blackPix = make([]byte, 8*h3*mxx*8*v3*myy)
-		d.blackStride = 8 * h3 * mxx
+		d.blackPix = make([]byte, bs*h3*mxx*bs*v3*myy)
+		d.blackStride = bs * h3 * mxx
 	}
+	return nil
+}
+
+// checkAllocationSize rejects sizes that would overflow slice/image allocation
+// arithmetic. It is not a resource budget; callers must still limit untrusted
+// image dimensions if they need an upper bound on memory consumption.
+func checkAllocationSize(n uint64) error {
+	if n > uint64(^uint(0)>>1) {
+		return UnsupportedError("image is too large")
+	}
+	return nil
 }
 
 // Specified in section B.2.3.
@@ -158,13 +192,23 @@ func (d *decoder) processSOS(n int) error {
 	mxx := (d.width + 8*d.maxH - 1) / (8 * d.maxH)
 	myy := (d.height + 8*d.maxV - 1) / (8 * d.maxV)
 	if d.img1 == nil && d.img3 == nil {
-		d.makeImg(mxx, myy)
+		if err := d.makeImg(mxx, myy); err != nil {
+			return err
+		}
 	}
 	if d.progressive {
 		for i := 0; i < nComp; i++ {
 			compIndex := scan[i].compIndex
 			if d.progCoeffs[compIndex] == nil {
-				d.progCoeffs[compIndex] = make([]block, mxx*myy*d.comp[compIndex].h*d.comp[compIndex].v)
+				nBlocks := mxx * myy * d.comp[compIndex].h * d.comp[compIndex].v
+				bs := 8 / d.factor
+				if err := checkAllocationSize(uint64(nBlocks) * uint64(bs*bs) * 4); err != nil {
+					return err
+				}
+				d.progCoeffs[compIndex] = make([]int32, nBlocks*bs*bs)
+				if d.factor != 1 {
+					d.progNonzero[compIndex] = make([]uint64, nBlocks)
+				}
 			}
 		}
 	}
@@ -226,14 +270,19 @@ func (d *decoder) processSOS(n int) error {
 					}
 
 					// Load the previous partially decoded coefficients, if applicable.
+					var nonzero uint64
 					if d.progressive {
-						b = d.progCoeffs[compIndex][by*mxx*hi+bx]
+						nonzero = d.loadProgressiveBlock(&b, int(compIndex), by*mxx*hi+bx)
 					} else {
 						b = block{}
 					}
 
 					if ah != 0 {
-						if err := d.refine(&b, &d.huff[acTable][scan[i].ta], zigStart, zigEnd, 1<<al); err != nil {
+						var mask *uint64
+						if d.factor != 1 {
+							mask = &nonzero
+						}
+						if err := d.refine(&b, &d.huff[acTable][scan[i].ta], zigStart, zigEnd, 1<<al, mask); err != nil {
 							return err
 						}
 					} else {
@@ -278,6 +327,9 @@ func (d *decoder) processSOS(n int) error {
 										return err
 									}
 									b[unzig[zig]] = ac << al
+									if d.progressive && d.factor != 1 {
+										nonzero |= uint64(1) << unzig[zig]
+									}
 								} else {
 									if val0 != 0x0f {
 										d.eobRun = uint16(1 << val0)
@@ -299,7 +351,7 @@ func (d *decoder) processSOS(n int) error {
 
 					if d.progressive {
 						// Save the coefficients.
-						d.progCoeffs[compIndex][by*mxx*hi+bx] = b
+						d.saveProgressiveBlock(&b, int(compIndex), by*mxx*hi+bx, nonzero)
 						// At this point, we could call reconstructBlock to dequantize and perform the
 						// inverse DCT, to save early stages of a progressive image to the *image.YCbCr
 						// buffers (the whole point of progressive encoding), but in Go, the jpeg.Decode
@@ -345,7 +397,7 @@ func (d *decoder) processSOS(n int) error {
 
 // refine decodes a successive approximation refinement block, as specified in
 // section G.1.2.
-func (d *decoder) refine(b *block, h *huffman, zigStart, zigEnd, delta int32) error {
+func (d *decoder) refine(b *block, h *huffman, zigStart, zigEnd, delta int32, nonzero *uint64) error {
 	// Refining a DC component is trivial.
 	if zigStart == 0 {
 		if zigEnd != 0 {
@@ -409,6 +461,9 @@ func (d *decoder) refine(b *block, h *huffman, zigStart, zigEnd, delta int32) er
 			}
 			if z != 0 {
 				b[unzig[zig]] = z
+				if nonzero != nil {
+					*nonzero |= uint64(1) << unzig[zig]
+				}
 			}
 		}
 	}
@@ -462,7 +517,9 @@ func (d *decoder) reconstructProgressiveImage() error {
 		stride := mxx * d.comp[i].h
 		for by := 0; by*v < d.height; by++ {
 			for bx := 0; bx*h < d.width; bx++ {
-				if err := d.reconstructBlock(&d.progCoeffs[i][by*stride+bx], bx, by, i); err != nil {
+				var b block
+				d.loadProgressiveBlock(&b, i, by*stride+bx)
+				if err := d.reconstructBlock(&b, bx, by, i); err != nil {
 					return err
 				}
 			}
@@ -474,11 +531,15 @@ func (d *decoder) reconstructProgressiveImage() error {
 // reconstructBlock dequantizes, performs the inverse DCT and stores the block
 // to the image.
 func (d *decoder) reconstructBlock(b *block, bx, by, compIndex int) error {
+	bs := 8 / d.factor
 	qt := &d.quant[d.comp[compIndex].tq]
-	for zig := 0; zig < blockSize; zig++ {
-		b[unzig[zig]] *= qt[zig]
+	for y := 0; y < bs; y++ {
+		for x := 0; x < bs; x++ {
+			u := y*8 + x
+			b[u] *= qt[u]
+		}
 	}
-	idct(b)
+	scaledIDCT(b, d.factor)
 
 	var h, v int
 	if d.flex {
@@ -490,17 +551,17 @@ func (d *decoder) reconstructBlock(b *block, bx, by, compIndex int) error {
 
 	dst, stride := []byte(nil), 0
 	if d.nComp == 1 {
-		dst, stride = d.img1.Pix[8*(by*d.img1.Stride+bx):], d.img1.Stride
+		dst, stride = d.img1.Pix[bs*(by*d.img1.Stride+bx):], d.img1.Stride
 	} else {
 		switch compIndex {
 		case 0:
-			dst, stride = d.img3.Y[8*(by*d.img3.YStride+bx):], d.img3.YStride
+			dst, stride = d.img3.Y[bs*(by*d.img3.YStride+bx):], d.img3.YStride
 		case 1:
-			dst, stride = d.img3.Cb[8*(by*d.img3.CStride+bx):], d.img3.CStride
+			dst, stride = d.img3.Cb[bs*(by*d.img3.CStride+bx):], d.img3.CStride
 		case 2:
-			dst, stride = d.img3.Cr[8*(by*d.img3.CStride+bx):], d.img3.CStride
+			dst, stride = d.img3.Cr[bs*(by*d.img3.CStride+bx):], d.img3.CStride
 		case 3:
-			dst, stride = d.blackPix[8*(by*d.blackStride+bx):], d.blackStride
+			dst, stride = d.blackPix[bs*(by*d.blackStride+bx):], d.blackStride
 		default:
 			return UnsupportedError("too many components")
 		}
@@ -508,10 +569,10 @@ func (d *decoder) reconstructBlock(b *block, bx, by, compIndex int) error {
 
 	if d.flex {
 		// Flex mode: expand each source pixel to h×v destination pixels.
-		for y := 0; y < 8; y++ {
-			y8 := y * 8
+		for y := 0; y < bs; y++ {
+			y8 := y * bs
 			yv := y * v
-			for x := 0; x < 8; x++ {
+			for x := 0; x < bs; x++ {
 				val := uint8(max(0, min(255, b[y8+x]+128)))
 				xh := x * h
 				for yy := 0; yy < v; yy++ {
@@ -525,10 +586,10 @@ func (d *decoder) reconstructBlock(b *block, bx, by, compIndex int) error {
 	}
 
 	// Level shift by +128, clip to [0, 255], and write to dst.
-	for y := 0; y < 8; y++ {
-		y8 := y * 8
+	for y := 0; y < bs; y++ {
+		y8 := y * bs
 		yStride := y * stride
-		for x := 0; x < 8; x++ {
+		for x := 0; x < bs; x++ {
 			dst[yStride+x] = uint8(max(0, min(255, b[y8+x]+128)))
 		}
 	}
