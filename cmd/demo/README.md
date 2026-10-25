@@ -77,7 +77,7 @@ CGO_ENABLED=0 go test -tags=jpegquality ./cmd/demo \
 If the browser disallows loading local `report.json`, serve the output:
 
 ```sh
-python3 -m http.server 8003 --directory /tmp/resizejpeg-quality-photos
+python3 -m http.server 8080 --directory /tmp/resizejpeg-quality-photos
 ```
 
 `djpeg` is optional. When available, the detailed report includes native
