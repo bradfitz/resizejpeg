@@ -650,6 +650,11 @@ func (d *decoder) decode(r io.Reader, configOnly bool) (image.Image, error) {
 		}
 	}
 
+	if d.resize != nil && d.resize.deferred {
+		if err := d.resize.reconstructProgressive(d); err != nil {
+			return nil, err
+		}
+	}
 	if d.resize != nil && d.resize.streaming {
 		return d.resize.result(d)
 	}

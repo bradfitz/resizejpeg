@@ -22,5 +22,11 @@
 // and non-interleaved inputs require an explicit full-buffer fallback; see
 // [ResizeOptions].
 //
+// [DecodeThumbnail] instead selects reduced IDCT with at least four-times
+// thumbnail headroom when the source allows it, then finishes with Lanczos3.
+// The same workers perform reduced transforms and horizontal filtering.
+// Original-image sampling coordinates avoid rounded-size phase drift.
+// This is faster but not pixel-equivalent to full decoding plus Lanczos3.
+//
 // JPEG is defined in ITU-T T.81: https://www.w3.org/Graphics/JPEG/itu-t81.pdf.
 package resizejpeg // import "github.com/bradfitz/resizejpeg"

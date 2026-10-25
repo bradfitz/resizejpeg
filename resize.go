@@ -13,21 +13,25 @@ import (
 	"sync"
 )
 
-// ResizeOptions controls [DecodeResize]. A nil pointer uses the zero values.
+// ResizeOptions controls [DecodeResize] and [DecodeThumbnail].
+// A nil pointer uses the zero values.
 type ResizeOptions struct {
-	// Workers is the number of full-IDCT/RGB/horizontal-filter workers.
+	// Workers is the number of IDCT/RGB/horizontal-filter workers.
 	// Zero uses min(GOMAXPROCS, 8); explicit values must be in [1, 64].
 	// The number is further limited by the number of source MCU rows.
 	// Entropy decoding and ordered vertical filtering remain serial.
 	Workers int
 
-	// AllowFullDecode permits a full-resolution fallback for progressive
-	// images and sequential scans that do not contain all components.
+	// AllowFullDecode permits image-wide buffers for progressive images and
+	// sequential scans that do not contain all components.
 	// By default those inputs return UnsupportedError before allocating
 	// source image planes or progressive coefficient arrays.
 	//
-	// The fallback uses image-wide pixel/coefficient buffers. It does not
-	// preserve the streaming path's bounded-scratch-memory guarantee.
+	// DecodeResize's fallback uses full-resolution pixels and coefficients.
+	// DecodeThumbnail uses its chosen reduced factor for fallback pixels
+	// and compact progressive coefficients; progressive reconstruction still
+	// uses row-band workers, without image-wide pixel planes. Neither
+	// fallback preserves the streaming path's bounded-memory guarantee.
 	AllowFullDecode bool
 
 	// MaxSourcePixels limits width*height before allocating source buffers.
@@ -63,9 +67,43 @@ func DecodeResize(r io.Reader, width, height int, opts *ResizeOptions) (*image.R
 	return im, err
 }
 
+// DecodeThumbnail decodes a JPEG at a reduced IDCT resolution, then resizes it
+// with scale-aware Lanczos3 to exactly width by height opaque RGB pixels.
+// It chooses the largest factor in 8, 4, 2, 1 that retains at least four times
+// each target dimension, or the original dimension when that is smaller.
+// The factor is chosen from the original dimensions before allocating buffers.
+// Unlike [DecodeResize], this may discard high-frequency coefficients before
+// sample clipping and RGB conversion, so the two APIs have different results.
+// The implementation is pure Go, without native libraries or external programs.
+//
+// Dimensions, options, color handling, streaming support, and source budgets
+// follow [DecodeResize]. Both dimensions must be positive and no larger than
+// the original; the decoder never upsamples the original image. Filtering
+// preserves the reduced samples' original-image phase, including at odd sizes.
+// Single-scan inputs use bounded reduced MCU-row buffers. IDCT, RGB conversion,
+// and horizontal filtering share the worker pool; entropy decoding and ordered
+// vertical filtering remain serial.
+//
+// With AllowFullDecode, progressive inputs retain image-wide compact
+// coefficients, but use row workers for final reconstruction without image-wide
+// pixel planes. Sequential non-interleaved fallback uses reduced pixel planes
+// and serial filtering.
+func DecodeThumbnail(r io.Reader, width, height int, opts *ResizeOptions) (*image.RGBA, error) {
+	im, _, err := decodeThumbnail(r, width, height, opts)
+	return im, err
+}
+
 // Returning the decoder lets package tests inspect the actual owned buffers
 // and verify worker shutdown, rather than inferring memory use from output size.
 func decodeResize(r io.Reader, width, height int, opts *ResizeOptions) (*image.RGBA, *decoder, error) {
+	return decodeResizeMode(r, width, height, opts, false)
+}
+
+func decodeThumbnail(r io.Reader, width, height int, opts *ResizeOptions) (*image.RGBA, *decoder, error) {
+	return decodeResizeMode(r, width, height, opts, true)
+}
+
+func decodeResizeMode(r io.Reader, width, height int, opts *ResizeOptions, thumbnail bool) (*image.RGBA, *decoder, error) {
 	var o ResizeOptions
 	if opts != nil {
 		o = *opts
@@ -79,7 +117,7 @@ func decodeResize(r io.Reader, width, height int, opts *ResizeOptions) (*image.R
 	if o.Workers == 0 {
 		o.Workers = min(runtime.GOMAXPROCS(0), 8)
 	}
-	req := &resizeRequest{width: width, height: height, opts: o}
+	req := &resizeRequest{width: width, height: height, opts: o, thumbnail: thumbnail}
 	d := &decoder{factor: 1, resize: req}
 	im, err := d.decode(r, false)
 	if err != nil {
@@ -88,15 +126,16 @@ func decodeResize(r io.Reader, width, height int, opts *ResizeOptions) (*image.R
 	if req.streaming {
 		return req.filter.dst, d, nil
 	}
-	// Only explicitly permitted inputs can get here with a full source image.
-	f, err := newLanczosResizer(d.width, d.height, width, height)
+	// Only explicitly permitted inputs can get here with image-wide pixels.
+	// Thumbnail fallback pixels already use the chosen reduced factor.
+	f, err := req.newFilter(d)
 	if err != nil {
 		return nil, d, err
 	}
 	req.filter = f
-	row := image.NewRGBA(image.Rect(0, 0, d.width, 1))
+	row := image.NewRGBA(image.Rect(0, 0, f.sw, 1))
 	values := make([]float64, 3*width)
-	for y := 0; y < d.height; y++ {
+	for y := 0; y < f.sh; y++ {
 		draw.Draw(row, row.Rect, im, image.Pt(0, y), draw.Src)
 		f.horizontal(values, row.Pix)
 		if err := f.addRows(values, y, 1); err != nil {
@@ -109,11 +148,35 @@ func decodeResize(r io.Reader, width, height int, opts *ResizeOptions) (*image.R
 	return f.dst, d, nil
 }
 
+// chooseThumbnailFactor retains fixed 4x headroom along both axes whenever
+// possible. Compare before multiplying so the helper is safe even for dimensions
+// larger than JPEG permits. The caller validates that dimensions are positive.
+func chooseThumbnailFactor(sw, sh, dw, dh int) int {
+	if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 {
+		return 1
+	}
+	minW, minH := sw, sh
+	if dw <= sw/4 {
+		minW = 4 * dw
+	}
+	if dh <= sh/4 {
+		minH = 4 * dh
+	}
+	for _, factor := range [...]int{8, 4, 2, 1} {
+		if (sw-1)/factor+1 >= minW && (sh-1)/factor+1 >= minH {
+			return factor
+		}
+	}
+	return 1
+}
+
 type resizeRequest struct {
 	width, height int
 	opts          ResizeOptions
+	thumbnail     bool
 	streaming     bool
 	fallback      bool
+	deferred      bool // Progressive thumbnail: coefficients only until EOI.
 	complete      bool
 	scans         int
 	filter        *lanczosResizer
@@ -129,6 +192,9 @@ func (r *resizeRequest) source(d *decoder) error {
 	}
 	if r.opts.MaxSourcePixels != 0 && uint64(d.width)*uint64(d.height) > r.opts.MaxSourcePixels {
 		return UnsupportedError("resize source exceeds pixel budget")
+	}
+	if r.thumbnail {
+		d.factor = chooseThumbnailFactor(d.width, d.height, r.width, r.height)
 	}
 	if d.progressive && !r.opts.AllowFullDecode {
 		return UnsupportedError("progressive resize requires AllowFullDecode")
@@ -149,7 +215,22 @@ func (r *resizeRequest) startScan(d *decoder, nComp, mxx, myy int) error {
 			return UnsupportedError("streaming resize requires one complete interleaved scan and known color model")
 		}
 		r.fallback = true
+		r.deferred = r.thumbnail && d.progressive
 		return nil
+	}
+	return r.startPipeline(d, mxx, myy)
+}
+
+func (r *resizeRequest) newFilter(d *decoder) (*lanczosResizer, error) {
+	if r.thumbnail {
+		return newScaledLanczosResizer(d.width, d.height, d.factor, r.width, r.height)
+	}
+	return newLanczosResizer(d.width, d.height, r.width, r.height)
+}
+
+func (r *resizeRequest) startPipeline(d *decoder, mxx, myy int) error {
+	if d.nComp == 4 && !d.adobeTransformValid {
+		return UnsupportedError("unknown color model: 4-component JPEG doesn't have Adobe APP14 metadata")
 	}
 	if d.nComp == 3 && d.isRGB() {
 		h0, h1, h2 := d.comp[0].h, d.comp[1].h, d.comp[2].h
@@ -158,7 +239,7 @@ func (r *resizeRequest) startScan(d *decoder, nComp, mxx, myy int) error {
 			return errUnsupportedSubsamplingRatio
 		}
 	}
-	f, err := newLanczosResizer(d.width, d.height, r.width, r.height)
+	f, err := r.newFilter(d)
 	if err != nil {
 		return err
 	}
@@ -169,6 +250,58 @@ func (r *resizeRequest) startScan(d *decoder, nComp, mxx, myy int) error {
 		return err
 	}
 	r.pipeline, r.streaming = p, true
+	return nil
+}
+
+// reconstructProgressive waits until all scans and metadata have been read,
+// then feeds compact retained coefficients through the same bounded worker
+// pipeline as sequential input. Only the coefficients are image-wide.
+func (r *resizeRequest) reconstructProgressive(d *decoder) (retErr error) {
+	mxx := (d.width + 8*d.maxH - 1) / (8 * d.maxH)
+	myy := (d.height + 8*d.maxV - 1) / (8 * d.maxV)
+	if err := r.startPipeline(d, mxx, myy); err != nil {
+		return err
+	}
+	p := r.pipeline
+	defer func() {
+		if err := p.closeAndWait(); retErr == nil {
+			retErr = err
+		}
+		if retErr == nil {
+			retErr = r.filter.finish()
+		}
+		r.complete = retErr == nil
+	}()
+	bandHeight := (8 / d.factor) * d.maxV
+	height := (d.height + d.factor - 1) / d.factor
+	for my := 0; my < myy; my++ {
+		b, err := p.acquire()
+		if err != nil {
+			return err
+		}
+		b.y = my * bandHeight
+		b.n = min(bandHeight, height-b.y)
+		for ci := 0; ci < d.nComp; ci++ {
+			// The full decoder leaves never-transmitted components zero,
+			// not IDCT(zero coefficients) == 128. These workers are newly
+			// allocated after all scans; this skip mask is identical in
+			// every band, so their untouched planes remain zero on reuse.
+			b.skip[ci] = d.progCoeffs[ci] == nil
+			if b.skip[ci] {
+				continue
+			}
+			stride := mxx * d.comp[ci].h
+			for by := 0; by < d.comp[ci].v; by++ {
+				for bx := 0; bx < stride; bx++ {
+					index := (my*d.comp[ci].v+by)*stride + bx
+					d.loadProgressiveBlock(&b.coeffs[ci][by*stride+bx], ci, index)
+				}
+			}
+		}
+		if err := p.submit(b); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -185,7 +318,8 @@ func (r *resizeRequest) result(d *decoder) (image.Image, error) {
 type resizeBand struct {
 	y, n   int
 	coeffs [maxComponents][]block
-	rows   []float64 // Packed, horizontally filtered RGB rows.
+	skip   [maxComponents]bool // Untransmitted progressive components.
+	rows   []float64           // Packed, horizontally filtered RGB rows.
 	err    error
 }
 
@@ -211,7 +345,9 @@ type resizePipeline struct {
 func newResizePipeline(d *decoder, req *resizeRequest, mxx, myy int) (*resizePipeline, error) {
 	nw := min(req.opts.Workers, myy)
 	nb := min(nw+1, myy)
-	bandHeight := 8 * d.maxV
+	originalBandHeight := 8 * d.maxV
+	bandHeight := originalBandHeight / d.factor
+	reducedWidth := (d.width + d.factor - 1) / d.factor
 	p := &resizePipeline{
 		filter: req.filter, free: make(chan *resizeBand, nb),
 		jobs: make(chan *resizeBand, nw), results: make(chan *resizeBand, nw),
@@ -237,17 +373,17 @@ func newResizePipeline(d *decoder, req *resizeRequest, mxx, myy int) (*resizePip
 	}
 	for range nw {
 		w := &resizeWorker{d: decoder{
-			width: d.width, height: bandHeight, factor: 1, nComp: d.nComp,
+			width: d.width, height: originalBandHeight, factor: d.factor, nComp: d.nComp,
 			maxH: d.maxH, maxV: d.maxV, comp: d.comp, quant: d.quant,
 			jfif: d.jfif, adobeTransformValid: d.adobeTransformValid, adobeTransform: d.adobeTransform,
 		}}
 		if err := w.d.makeImg(mxx, 1); err != nil {
 			return nil, err
 		}
-		if err := checkAllocationSize(uint64(d.width) * uint64(bandHeight) * 4); err != nil {
+		if err := checkAllocationSize(uint64(reducedWidth) * uint64(bandHeight) * 4); err != nil {
 			return nil, err
 		}
-		w.rgba = image.NewRGBA(image.Rect(0, 0, d.width, bandHeight))
+		w.rgba = image.NewRGBA(image.Rect(0, 0, reducedWidth, bandHeight))
 		p.workers = append(p.workers, w)
 	}
 	// No goroutines start until every allocation/validation above succeeds.
@@ -326,6 +462,9 @@ func (p *resizePipeline) closeAndWait() error {
 func (w *resizeWorker) process(b *resizeBand, f *lanczosResizer, mxx int) error {
 	d := &w.d
 	for ci := 0; ci < d.nComp; ci++ {
+		if b.skip[ci] {
+			continue
+		}
 		stride := mxx * d.comp[ci].h
 		for by := 0; by < d.comp[ci].v; by++ {
 			for bx := 0; bx < stride; bx++ {
@@ -335,7 +474,8 @@ func (w *resizeWorker) process(b *resizeBand, f *lanczosResizer, mxx int) error 
 			}
 		}
 	}
-	rect := image.Rect(0, 0, d.width, b.n)
+	width := w.rgba.Rect.Dx()
+	rect := image.Rect(0, 0, width, b.n)
 	if d.nComp == 1 {
 		draw.Draw(w.rgba, rect, d.img1, image.Point{}, draw.Src)
 	} else if d.nComp == 3 && !d.isRGB() {
@@ -345,7 +485,7 @@ func (w *resizeWorker) process(b *resizeBand, f *lanczosResizer, mxx int) error 
 		for y := 0; y < b.n; y++ {
 			yo, co := d.img3.YOffset(0, y), d.img3.COffset(0, y)
 			dst := w.rgba.Pix[y*w.rgba.Stride:]
-			for x := 0; x < d.width; x++ {
+			for x := 0; x < width; x++ {
 				dst[4*x+0], dst[4*x+1], dst[4*x+2], dst[4*x+3] =
 					d.img3.Y[yo+x], d.img3.Cb[co+x/scale], d.img3.Cr[co+x/scale], 255
 			}
@@ -357,7 +497,7 @@ func (w *resizeWorker) process(b *resizeBand, f *lanczosResizer, mxx int) error 
 		for y := 0; y < b.n; y++ {
 			yo := d.img3.YOffset(0, y)
 			dst := w.rgba.Pix[y*w.rgba.Stride:]
-			for x := 0; x < d.width; x++ {
+			for x := 0; x < width; x++ {
 				k := 255 - d.blackPix[y*d.blackStride+x]
 				var c, m, yellow byte
 				if d.adobeTransform == adobeTransformUnknown {

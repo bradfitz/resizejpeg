@@ -73,8 +73,13 @@ func lanczosKernel(distance float64) float64 {
 // golang.org/x/image/draw's Kernel scaler (scale.go, newDistrib).
 // Clamp in floating point before converting to int: the unbounded support can
 // extend past maxInt even when the source row itself has a valid byte size.
-func lanczosBounds(src, dst, pos int) (first, last int, center, argScale float64) {
-	scale := float64(src) / float64(dst)
+//
+// extent is the original source length divided by its IDCT reduction factor.
+// It may be fractional: the final reduced sample of an odd-sized JPEG covers
+// some padded pixels. Mapping the rounded-up sample count as if it were the
+// original extent would shift the sampling phase across the entire image.
+func lanczosBounds(src int, extent float64, dst, pos int) (first, last int, center, argScale float64) {
+	scale := extent / float64(dst)
 	halfWidth := 3.0
 	argScale = 1
 	if scale > 1 {
@@ -102,10 +107,10 @@ func lanczosBounds(src, dst, pos int) (first, last int, center, argScale float64
 	return
 }
 
-func lanczosSpans(src, dst int) []lanczosSpan {
+func lanczosSpans(src int, extent float64, dst int) []lanczosSpan {
 	spans := make([]lanczosSpan, dst)
 	for d := range spans {
-		first, last, center, argScale := lanczosBounds(src, dst, d)
+		first, last, center, argScale := lanczosBounds(src, extent, dst, d)
 		sum := 0.0
 		lo, hi := last, first
 		for s := first; s < last; s++ {
@@ -122,6 +127,35 @@ func lanczosSpans(src, dst int) []lanczosSpan {
 }
 
 func newLanczosResizer(sw, sh, dw, dh int) (*lanczosResizer, error) {
+	return newLanczosResizerExtent(sw, sh, dw, dh, float64(sw), float64(sh))
+}
+
+// newScaledLanczosResizer consumes the ceil-rounded reduced-IDCT sample grid
+// while preserving the original image's sampling coordinates. Factor 1 is
+// exactly the existing full-resolution resizer.
+func newScaledLanczosResizer(originalWidth, originalHeight, factor, dw, dh int) (*lanczosResizer, error) {
+	switch factor {
+	case 1, 2, 4, 8:
+	default:
+		return nil, UnsupportedError("invalid resize IDCT factor")
+	}
+	if originalWidth <= 0 || originalHeight <= 0 {
+		return nil, UnsupportedError("invalid resize dimensions")
+	}
+	// Quotient/remainder avoids overflowing original+factor-1 on 32-bit
+	// platforms or when the constructor is called directly by tests.
+	sw, sh := originalWidth/factor, originalHeight/factor
+	if originalWidth%factor != 0 {
+		sw++
+	}
+	if originalHeight%factor != 0 {
+		sh++
+	}
+	return newLanczosResizerExtent(sw, sh, dw, dh,
+		float64(originalWidth)/float64(factor), float64(originalHeight)/float64(factor))
+}
+
+func newLanczosResizerExtent(sw, sh, dw, dh int, extentX, extentY float64) (*lanczosResizer, error) {
 	if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 {
 		return nil, UnsupportedError("invalid resize dimensions")
 	}
@@ -159,8 +193,8 @@ func newLanczosResizer(sw, sh, dw, dh int) (*lanczosResizer, error) {
 	// spare slot for boundary arithmetic. Enlargement scales the bound by
 	// dh/sh. Clamp before converting to int.
 	rowBound := 7.0
-	if dh > sh {
-		rowBound = math.Ceil(6*(float64(dh)/float64(sh))) + 1
+	if float64(dh) > extentY {
+		rowBound = math.Ceil(6*(float64(dh)/extentY)) + 1
 	}
 	ringRows := dh
 	if rowBound < float64(dh) {
@@ -173,20 +207,20 @@ func newLanczosResizer(sw, sh, dw, dh int) (*lanczosResizer, error) {
 
 	r := &lanczosResizer{
 		sw: sw, sh: sh, dw: dw, dh: dh,
-		x:        lanczosSpans(sw, dw),
-		y:        lanczosSpans(sh, dh),
+		x:        lanczosSpans(sw, extentX, dw),
+		y:        lanczosSpans(sh, extentY, dh),
 		ringRows: ringRows,
 	}
 	r.sums = make([]float64, sumBytes/8)
 	r.xWeights = make([]float64, 0, int(taps))
-	_, _, _, argScale := lanczosBounds(sw, dw, 0)
+	_, _, _, argScale := lanczosBounds(sw, extentX, dw, 0)
 	for _, span := range r.x {
 		for s := span.first; s < span.last; s++ {
 			r.xWeights = append(r.xWeights,
 				lanczosKernel(math.Abs((span.center-float64(s))*argScale)))
 		}
 	}
-	_, _, _, r.yScale = lanczosBounds(sh, dh, 0)
+	_, _, _, r.yScale = lanczosBounds(sh, extentY, dh, 0)
 	r.dst = image.NewRGBA(image.Rect(0, 0, dw, dh))
 	return r, nil
 }

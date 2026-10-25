@@ -211,7 +211,11 @@ func (d *decoder) processSOS(n int) (retErr error) {
 			}()
 		}
 	}
-	if pipeline == nil && d.img1 == nil && d.img3 == nil {
+	// Progressive thumbnails retain compact coefficients until EOI, then
+	// reconstruct row bands in workers rather than allocating image-wide
+	// reduced pixel planes.
+	deferred := d.resize != nil && d.resize.deferred
+	if pipeline == nil && !deferred && d.img1 == nil && d.img3 == nil {
 		if err := d.makeImg(mxx, myy); err != nil {
 			return err
 		}
@@ -224,6 +228,11 @@ func (d *decoder) processSOS(n int) (retErr error) {
 				bs := 8 / d.factor
 				if err := checkAllocationSize(uint64(nBlocks) * uint64(bs*bs) * 4); err != nil {
 					return err
+				}
+				if d.factor != 1 {
+					if err := checkAllocationSize(uint64(nBlocks) * 8); err != nil {
+						return err
+					}
 				}
 				d.progCoeffs[compIndex] = make([]int32, nBlocks*bs*bs)
 				if d.factor != 1 {
@@ -252,8 +261,9 @@ func (d *decoder) processSOS(n int) (retErr error) {
 			if err != nil {
 				return err
 			}
-			band.y = my * 8 * d.maxV
-			band.n = min(8*d.maxV, d.height-band.y)
+			bandHeight := (8 / d.factor) * d.maxV
+			band.y = my * bandHeight
+			band.n = min(bandHeight, (d.height+d.factor-1)/d.factor-band.y)
 		}
 		for mx := 0; mx < mxx; mx++ {
 			for i := 0; i < nComp; i++ {
@@ -393,7 +403,7 @@ func (d *decoder) processSOS(n int) (retErr error) {
 					}
 					if pipeline != nil {
 						// DC prediction is already resolved. The worker owns
-						// dequantization and full IDCT for this coefficient copy.
+						// dequantization and the chosen IDCT for this copy.
 						band.coeffs[compIndex][(by%vi)*mxx*hi+bx] = b
 					} else {
 						if err := d.reconstructBlock(&b, bx, by, int(compIndex)); err != nil {
