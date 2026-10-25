@@ -91,7 +91,7 @@ func checkAllocationSize(n uint64) error {
 }
 
 // Specified in section B.2.3.
-func (d *decoder) processSOS(n int) error {
+func (d *decoder) processSOS(n int) (retErr error) {
 	if d.nComp == 0 {
 		return FormatError("missing SOF marker")
 	}
@@ -191,7 +191,27 @@ func (d *decoder) processSOS(n int) error {
 	// For flex mode, Y may not have the maximum factors.
 	mxx := (d.width + 8*d.maxH - 1) / (8 * d.maxH)
 	myy := (d.height + 8*d.maxV - 1) / (8 * d.maxV)
-	if d.img1 == nil && d.img3 == nil {
+	var pipeline *resizePipeline
+	if d.resize != nil {
+		if err := d.resize.startScan(d, nComp, mxx, myy); err != nil {
+			return err
+		}
+		if d.resize.streaming {
+			pipeline = d.resize.pipeline
+			defer func() {
+				// Always join on malformed/truncated input too. Workers never
+				// read the input or decoder entropy state.
+				if err := pipeline.closeAndWait(); retErr == nil {
+					retErr = err
+				}
+				if retErr == nil {
+					retErr = d.resize.filter.finish()
+				}
+				d.resize.complete = retErr == nil
+			}()
+		}
+	}
+	if pipeline == nil && d.img1 == nil && d.img3 == nil {
 		if err := d.makeImg(mxx, myy); err != nil {
 			return err
 		}
@@ -225,6 +245,16 @@ func (d *decoder) processSOS(n int) error {
 		blockCount int
 	)
 	for my := 0; my < myy; my++ {
+		var band *resizeBand
+		if pipeline != nil {
+			var err error
+			band, err = pipeline.acquire()
+			if err != nil {
+				return err
+			}
+			band.y = my * 8 * d.maxV
+			band.n = min(8*d.maxV, d.height-band.y)
+		}
 		for mx := 0; mx < mxx; mx++ {
 			for i := 0; i < nComp; i++ {
 				compIndex := scan[i].compIndex
@@ -361,8 +391,14 @@ func (d *decoder) processSOS(n int) error {
 						// SOS markers are processed.
 						continue
 					}
-					if err := d.reconstructBlock(&b, bx, by, int(compIndex)); err != nil {
-						return err
+					if pipeline != nil {
+						// DC prediction is already resolved. The worker owns
+						// dequantization and full IDCT for this coefficient copy.
+						band.coeffs[compIndex][(by%vi)*mxx*hi+bx] = b
+					} else {
+						if err := d.reconstructBlock(&b, bx, by, int(compIndex)); err != nil {
+							return err
+						}
 					}
 				} // for j
 			} // for i
@@ -390,6 +426,11 @@ func (d *decoder) processSOS(n int) error {
 				d.eobRun = 0
 			}
 		} // for mx
+		if pipeline != nil {
+			if err := pipeline.submit(band); err != nil {
+				return err
+			}
+		}
 	} // for my
 
 	return nil

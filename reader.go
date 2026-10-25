@@ -111,6 +111,7 @@ type decoder struct {
 	}
 	width, height int
 	factor        int // Decode at 1/factor resolution; one of 1, 2, 4, 8.
+	resize        *resizeRequest
 
 	img1        *image.Gray
 	img3        *image.YCbCr
@@ -602,6 +603,9 @@ func (d *decoder) decode(r io.Reader, configOnly bool) (image.Image, error) {
 			d.baseline = marker == sof0Marker
 			d.progressive = marker == sof2Marker
 			err = d.processSOF(n)
+			if err == nil && d.resize != nil {
+				err = d.resize.source(d)
+			}
 			if configOnly && d.jfif {
 				return nil, err
 			}
@@ -646,6 +650,9 @@ func (d *decoder) decode(r io.Reader, configOnly bool) (image.Image, error) {
 		}
 	}
 
+	if d.resize != nil && d.resize.streaming {
+		return d.resize.result(d)
+	}
 	if d.progressive {
 		if err := d.reconstructProgressiveImage(); err != nil {
 			return nil, err
