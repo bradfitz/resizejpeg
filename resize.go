@@ -16,6 +16,21 @@ import (
 // ResizeOptions controls [DecodeResize] and [DecodeThumbnail].
 // A nil pointer uses the zero values.
 type ResizeOptions struct {
+	// Filter selects the final scale-aware resampling filter.
+	// The zero value is Lanczos3. CatmullRom uses a narrower cubic kernel;
+	// Bilinear uses a cheaper, softer triangle kernel. All three widen
+	// their support when reducing, rather than sampling a fixed few pixels.
+	Filter Filter
+
+	// ThumbnailHeadroom controls DecodeThumbnail's intermediate dimensions.
+	// Zero uses 4. Positive values retain at least that multiple of each
+	// target dimension when the source permits, choosing an IDCT factor
+	// from 8, 4, 2, 1. A value of 2 commonly processes about four times
+	// fewer intermediate pixels than 4, at some loss of fine detail.
+	// Factor limits and source dimensions can prevent that reduction.
+	// DecodeResize ignores positive values and always performs full IDCT.
+	ThumbnailHeadroom int
+
 	// Workers is the number of IDCT/RGB/horizontal-filter workers.
 	// Zero uses min(GOMAXPROCS, 8); explicit values must be in [1, 64].
 	// The number is further limited by the number of source MCU rows.
@@ -40,12 +55,13 @@ type ResizeOptions struct {
 	MaxSourcePixels uint64
 }
 
-// DecodeResize fully decodes JPEG samples and resizes them with scale-aware
-// Lanczos3, returning an opaque RGB image of exactly width by height pixels.
+// DecodeResize fully decodes JPEG samples and resizes them with the selected
+// scale-aware filter (Lanczos3 by default), returning an opaque RGB image of
+// exactly width by height pixels.
 // Both dimensions must be positive and no larger than the source dimensions.
-// Non-positive or out-of-JPEG-range target dimensions and invalid worker
-// counts are rejected without reading r. Upsampling is rejected after reading
-// the source dimensions.
+// Non-positive or out-of-JPEG-range target dimensions, invalid filters or
+// worker counts, and negative headroom are rejected without reading r.
+// Upsampling is rejected after reading the source dimensions.
 //
 // Unlike [Decode] at reduced factors, this applies full 8x8 IDCT, sample
 // clipping, and RGB conversion before resizing. Filtering uses encoded RGB
@@ -68,9 +84,10 @@ func DecodeResize(r io.Reader, width, height int, opts *ResizeOptions) (*image.R
 }
 
 // DecodeThumbnail decodes a JPEG at a reduced IDCT resolution, then resizes it
-// with scale-aware Lanczos3 to exactly width by height opaque RGB pixels.
-// It chooses the largest factor in 8, 4, 2, 1 that retains at least four times
-// each target dimension, or the original dimension when that is smaller.
+// with the selected scale-aware filter (Lanczos3 by default) to exactly width
+// by height opaque RGB pixels. It chooses the largest factor in 8, 4, 2, 1
+// that retains at least ThumbnailHeadroom times each target dimension
+// (four by default), or the original dimension when that is smaller.
 // The factor is chosen from the original dimensions before allocating buffers.
 // Unlike [DecodeResize], this may discard high-frequency coefficients before
 // sample clipping and RGB conversion, so the two APIs have different results.
@@ -111,6 +128,15 @@ func decodeResizeMode(r io.Reader, width, height int, opts *ResizeOptions, thumb
 	if width <= 0 || height <= 0 || width > 65535 || height > 65535 {
 		return nil, nil, UnsupportedError("resize dimensions must be in [1, 65535]")
 	}
+	if !o.Filter.valid() {
+		return nil, nil, UnsupportedError("invalid resize filter")
+	}
+	if o.ThumbnailHeadroom < 0 {
+		return nil, nil, UnsupportedError("resize thumbnail headroom must be non-negative")
+	}
+	if o.ThumbnailHeadroom == 0 {
+		o.ThumbnailHeadroom = 4
+	}
 	if o.Workers < 0 || o.Workers > 64 {
 		return nil, nil, UnsupportedError("resize workers must be in [0, 64]")
 	}
@@ -148,19 +174,27 @@ func decodeResizeMode(r io.Reader, width, height int, opts *ResizeOptions, thumb
 	return f.dst, d, nil
 }
 
-// chooseThumbnailFactor retains fixed 4x headroom along both axes whenever
-// possible. Compare before multiplying so the helper is safe even for dimensions
-// larger than JPEG permits. The caller validates that dimensions are positive.
+// chooseThumbnailFactor is the default four-times-headroom policy.
 func chooseThumbnailFactor(sw, sh, dw, dh int) int {
-	if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 {
+	return chooseThumbnailFactorHeadroom(sw, sh, dw, dh, 4)
+}
+
+// Compare before multiplying so even a maxInt headroom cannot overflow.
+// Invalid dimensions/headroom conservatively keep full resolution; public
+// callers validate these values before reading the input.
+func chooseThumbnailFactorHeadroom(sw, sh, dw, dh, headroom int) int {
+	if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 || headroom < 0 {
 		return 1
 	}
-	minW, minH := sw, sh
-	if dw <= sw/4 {
-		minW = 4 * dw
+	if headroom == 0 {
+		headroom = 4
 	}
-	if dh <= sh/4 {
-		minH = 4 * dh
+	minW, minH := sw, sh
+	if dw <= sw/headroom {
+		minW = headroom * dw
+	}
+	if dh <= sh/headroom {
+		minH = headroom * dh
 	}
 	for _, factor := range [...]int{8, 4, 2, 1} {
 		if (sw-1)/factor+1 >= minW && (sh-1)/factor+1 >= minH {
@@ -194,7 +228,7 @@ func (r *resizeRequest) source(d *decoder) error {
 		return UnsupportedError("resize source exceeds pixel budget")
 	}
 	if r.thumbnail {
-		d.factor = chooseThumbnailFactor(d.width, d.height, r.width, r.height)
+		d.factor = chooseThumbnailFactorHeadroom(d.width, d.height, r.width, r.height, r.opts.ThumbnailHeadroom)
 	}
 	if d.progressive && !r.opts.AllowFullDecode {
 		return UnsupportedError("progressive resize requires AllowFullDecode")
@@ -223,9 +257,9 @@ func (r *resizeRequest) startScan(d *decoder, nComp, mxx, myy int) error {
 
 func (r *resizeRequest) newFilter(d *decoder) (*lanczosResizer, error) {
 	if r.thumbnail {
-		return newScaledLanczosResizer(d.width, d.height, d.factor, r.width, r.height)
+		return newScaledFilteredResizer(d.width, d.height, d.factor, r.width, r.height, r.opts.Filter)
 	}
-	return newLanczosResizer(d.width, d.height, r.width, r.height)
+	return newFilteredResizer(d.width, d.height, r.width, r.height, r.opts.Filter)
 }
 
 func (r *resizeRequest) startPipeline(d *decoder, mxx, myy int) error {

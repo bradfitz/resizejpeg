@@ -17,13 +17,17 @@
 // depends on the source dimensions, not just the output dimensions.
 //
 // [DecodeResize] instead performs full IDCT and RGB conversion before applying
-// scale-aware Lanczos3. Single-scan inputs use bounded MCU-row buffers and
-// parallel workers, rather than a full-resolution source image. Progressive
+// a selectable scale-aware filter (Lanczos3 by default). Single-scan inputs use
+// bounded MCU-row buffers and parallel workers, rather than a full-resolution
+// source image. Progressive
 // and non-interleaved inputs require an explicit full-buffer fallback; see
 // [ResizeOptions].
 //
-// [DecodeThumbnail] instead selects reduced IDCT with at least four-times
-// thumbnail headroom when the source allows it, then finishes with Lanczos3.
+// [DecodeThumbnail] instead selects reduced IDCT with configurable thumbnail
+// headroom, then finishes with the selected filter. Defaults are four-times
+// headroom and Lanczos3; CatmullRom and Bilinear use narrower kernels.
+// [ResizeOptions.ThumbnailHeadroom] can reduce intermediate pixel work
+// independently of [ResizeOptions.Filter].
 // The same workers perform reduced transforms and horizontal filtering.
 // Original-image sampling coordinates avoid rounded-size phase drift.
 // This is faster but not pixel-equivalent to full decoding plus Lanczos3.

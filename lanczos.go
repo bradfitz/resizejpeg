@@ -11,8 +11,10 @@ import (
 )
 
 // lanczosSpan describes the contributing source samples for one output sample.
-// The half-open bounds omit zero-weight samples at the ends. Samples outside
-// the image are discarded, and invWeight renormalizes the remaining samples.
+// The half-open bounds omit samples outside the kernel support. Zero weights
+// inside that support are retained so span endpoints remain monotonic, even
+// for Catmull-Rom's interior zeros. Samples outside the image are discarded,
+// and invWeight renormalizes the remaining samples.
 type lanczosSpan struct {
 	first, last       int
 	center, invWeight float64
@@ -33,6 +35,7 @@ type lanczosResizer struct {
 	x, y     []lanczosSpan
 	xWeights []float64
 	yScale   float64
+	kernel   func(float64) float64
 
 	sums                  []float64
 	ringRows              int
@@ -68,7 +71,7 @@ func lanczosKernel(distance float64) float64 {
 	return math.Sin(x) * math.Sin(x/3) / (x * x / 3)
 }
 
-// lanczosBounds uses pixel centers, not pixel corners. Its mapping, widened
+// filterBounds uses pixel centers, not pixel corners. Its mapping, widened
 // support on reduction, and truncated edge normalization agree with
 // golang.org/x/image/draw's Kernel scaler (scale.go, newDistrib).
 // Clamp in floating point before converting to int: the unbounded support can
@@ -78,9 +81,9 @@ func lanczosKernel(distance float64) float64 {
 // It may be fractional: the final reduced sample of an odd-sized JPEG covers
 // some padded pixels. Mapping the rounded-up sample count as if it were the
 // original extent would shift the sampling phase across the entire image.
-func lanczosBounds(src int, extent float64, dst, pos int) (first, last int, center, argScale float64) {
+func filterBounds(src int, extent float64, dst, pos, support int) (first, last int, center, argScale float64) {
 	scale := extent / float64(dst)
-	halfWidth := 3.0
+	halfWidth := float64(support)
 	argScale = 1
 	if scale > 1 {
 		halfWidth *= scale
@@ -107,18 +110,18 @@ func lanczosBounds(src int, extent float64, dst, pos int) (first, last int, cent
 	return
 }
 
-func lanczosSpans(src int, extent float64, dst int) []lanczosSpan {
+func filterSpans(src int, extent float64, dst, support int, kernel func(float64) float64) []lanczosSpan {
 	spans := make([]lanczosSpan, dst)
 	for d := range spans {
-		first, last, center, argScale := lanczosBounds(src, extent, dst, d)
+		first, last, center, argScale := filterBounds(src, extent, dst, d, support)
 		sum := 0.0
 		lo, hi := last, first
 		for s := first; s < last; s++ {
-			weight := lanczosKernel(math.Abs((center - float64(s)) * argScale))
-			if weight != 0 {
+			distance := math.Abs((center - float64(s)) * argScale)
+			if distance < float64(support) {
 				lo = min(lo, s)
 				hi = s + 1
-				sum += weight
+				sum += kernel(distance)
 			}
 		}
 		spans[d] = lanczosSpan{lo, hi, center, 1 / sum}
@@ -127,13 +130,21 @@ func lanczosSpans(src int, extent float64, dst int) []lanczosSpan {
 }
 
 func newLanczosResizer(sw, sh, dw, dh int) (*lanczosResizer, error) {
-	return newLanczosResizerExtent(sw, sh, dw, dh, float64(sw), float64(sh))
+	return newFilteredResizer(sw, sh, dw, dh, Lanczos3)
+}
+
+func newFilteredResizer(sw, sh, dw, dh int, filter Filter) (*lanczosResizer, error) {
+	return newFilteredResizerExtent(sw, sh, dw, dh, float64(sw), float64(sh), filter)
 }
 
 // newScaledLanczosResizer consumes the ceil-rounded reduced-IDCT sample grid
 // while preserving the original image's sampling coordinates. Factor 1 is
 // exactly the existing full-resolution resizer.
 func newScaledLanczosResizer(originalWidth, originalHeight, factor, dw, dh int) (*lanczosResizer, error) {
+	return newScaledFilteredResizer(originalWidth, originalHeight, factor, dw, dh, Lanczos3)
+}
+
+func newScaledFilteredResizer(originalWidth, originalHeight, factor, dw, dh int, filter Filter) (*lanczosResizer, error) {
 	switch factor {
 	case 1, 2, 4, 8:
 	default:
@@ -151,14 +162,18 @@ func newScaledLanczosResizer(originalWidth, originalHeight, factor, dw, dh int) 
 	if originalHeight%factor != 0 {
 		sh++
 	}
-	return newLanczosResizerExtent(sw, sh, dw, dh,
-		float64(originalWidth)/float64(factor), float64(originalHeight)/float64(factor))
+	return newFilteredResizerExtent(sw, sh, dw, dh,
+		float64(originalWidth)/float64(factor), float64(originalHeight)/float64(factor), filter)
 }
 
-func newLanczosResizerExtent(sw, sh, dw, dh int, extentX, extentY float64) (*lanczosResizer, error) {
+func newFilteredResizerExtent(sw, sh, dw, dh int, extentX, extentY float64, filter Filter) (*lanczosResizer, error) {
+	if !filter.valid() {
+		return nil, UnsupportedError("invalid resize filter")
+	}
 	if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 {
 		return nil, UnsupportedError("invalid resize dimensions")
 	}
+	support, kernel := filter.kernel()
 	// Check all known allocation sizes before allocating anything. Source
 	// height does not participate in a pixel or floating-point allocation.
 	for _, factors := range [][]int{
@@ -176,7 +191,7 @@ func newLanczosResizerExtent(sw, sh, dw, dh int, extentX, extentY float64) (*lan
 	// dimensions. Each span contains at most its support width plus two
 	// boundary samples; alternatively, it cannot exceed the whole source.
 	// The source-row and span-size checks above make this sum fit uint64.
-	taps := 6*uint64(max(sw, dw)) + 2*uint64(dw)
+	taps := uint64(2*support)*uint64(max(sw, dw)) + 2*uint64(dw)
 	if uint64(sw) <= taps/uint64(dw) {
 		taps = uint64(sw) * uint64(dw)
 	}
@@ -187,14 +202,14 @@ func newLanczosResizerExtent(sw, sh, dw, dh int, extentX, extentY float64) (*lan
 		return nil, err
 	}
 
-	// In source coordinates an output support interval is six scale units
-	// wide on reduction, or six pixels wide on enlargement. Thus one input
-	// row can overlap at most six output rows when shrinking; allow one
-	// spare slot for boundary arithmetic. Enlargement scales the bound by
-	// dh/sh. Clamp before converting to int.
-	rowBound := 7.0
+	// An output support interval is 2*support scale units wide on reduction,
+	// or 2*support pixels wide on enlargement. Thus an input row can overlap
+	// at most 2*support output rows when shrinking; allow one spare slot for
+	// boundary arithmetic. Enlargement scales the bound by dh/extentY,
+	// including fractional extents smaller than one. Clamp before conversion.
+	rowBound := float64(2*support + 1)
 	if float64(dh) > extentY {
-		rowBound = math.Ceil(6*(float64(dh)/extentY)) + 1
+		rowBound = math.Ceil(float64(2*support)*(float64(dh)/extentY)) + 1
 	}
 	ringRows := dh
 	if rowBound < float64(dh) {
@@ -207,20 +222,21 @@ func newLanczosResizerExtent(sw, sh, dw, dh int, extentX, extentY float64) (*lan
 
 	r := &lanczosResizer{
 		sw: sw, sh: sh, dw: dw, dh: dh,
-		x:        lanczosSpans(sw, extentX, dw),
-		y:        lanczosSpans(sh, extentY, dh),
+		x:        filterSpans(sw, extentX, dw, support, kernel),
+		y:        filterSpans(sh, extentY, dh, support, kernel),
+		kernel:   kernel,
 		ringRows: ringRows,
 	}
 	r.sums = make([]float64, sumBytes/8)
 	r.xWeights = make([]float64, 0, int(taps))
-	_, _, _, argScale := lanczosBounds(sw, extentX, dw, 0)
+	_, _, _, argScale := filterBounds(sw, extentX, dw, 0, support)
 	for _, span := range r.x {
 		for s := span.first; s < span.last; s++ {
 			r.xWeights = append(r.xWeights,
-				lanczosKernel(math.Abs((span.center-float64(s))*argScale)))
+				kernel(math.Abs((span.center-float64(s))*argScale)))
 		}
 	}
-	_, _, _, r.yScale = lanczosBounds(sh, extentY, dh, 0)
+	_, _, _, r.yScale = filterBounds(sh, extentY, dh, 0, support)
 	r.dst = image.NewRGBA(image.Rect(0, 0, dw, dh))
 	return r, nil
 }
@@ -253,11 +269,11 @@ func (r *lanczosResizer) horizontal(dst []float64, src []byte) {
 // y. It does not retain rows. Invalid calls leave the resizer unchanged.
 func (r *lanczosResizer) addRows(rows []float64, y, n int) error {
 	if y < 0 || y > r.sh || n < 0 || n > r.sh-y || y != r.nextSourceY {
-		return FormatError("invalid Lanczos row order or bounds")
+		return FormatError("invalid resize row order or bounds")
 	}
 	stride := 3 * r.dw // Checked by the constructor.
 	if n > len(rows)/stride {
-		return FormatError("short Lanczos rows")
+		return FormatError("short resize rows")
 	}
 	for sourceY := y; sourceY < y+n; sourceY++ {
 		for r.nextOpen < r.dh && r.y[r.nextOpen].first <= sourceY {
@@ -268,7 +284,7 @@ func (r *lanczosResizer) addRows(rows []float64, y, n int) error {
 		src := rows[(sourceY-y)*stride : (sourceY-y+1)*stride]
 		for d := r.firstActive; d < r.nextOpen; d++ {
 			span := r.y[d]
-			weight := lanczosKernel(math.Abs((span.center - float64(sourceY)) * r.yScale))
+			weight := r.kernel(math.Abs((span.center - float64(sourceY)) * r.yScale))
 			if weight == 0 {
 				continue
 			}
@@ -312,7 +328,7 @@ func (r *lanczosResizer) writeRow(y int) {
 
 func (r *lanczosResizer) finish() error {
 	if r.nextSourceY != r.sh || r.firstActive != r.dh {
-		return FormatError("incomplete Lanczos rows")
+		return FormatError("incomplete resize rows")
 	}
 	return nil
 }
